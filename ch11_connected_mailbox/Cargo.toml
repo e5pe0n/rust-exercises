@@ -1,0 +1,3 @@
+[workspace]
+resolver = "3"
+members = ["simple_db", "tcp_server"]
