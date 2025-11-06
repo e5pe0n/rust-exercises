@@ -1,6 +1,7 @@
 use std::{
     io::{self, BufRead, Write},
     net::{TcpListener, TcpStream},
+    thread,
 };
 
 fn handle_client(stream: TcpStream) -> Result<(), io::Error> {
@@ -21,7 +22,14 @@ fn main() -> Result<(), io::Error> {
     let listener = TcpListener::bind("127.0.0.1:7878")?;
 
     for stream in listener.incoming() {
-        handle_client(stream?)?;
+        if let Ok(stream) = stream {
+            thread::spawn(|| {
+                _ = handle_client(stream);
+            });
+        } else {
+            eprintln!("Bad connection");
+            continue;
+        }
     }
     Ok(())
 }
