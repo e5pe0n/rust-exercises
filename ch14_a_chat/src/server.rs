@@ -73,24 +73,33 @@ async fn connection_loop(
 
     loop {
         tokio::select! {
-            Ok(Some(line)) = lines.next_line() => {
-                let (dest, msg) = match line.find(':') {
-                    None => continue,
-                    Some(idx) => (&line[..idx], line[idx + 1..].trim()),
-                };
-                let dest = dest
-                    .split(',')
-                    .map(|name| name.trim().to_string())
-                    .collect::<Vec<_>>();
-                let msg = msg.to_string();
+            line_result = lines.next_line() => match line_result {
+                Ok(Some(line)) => {
+                    let (dest, msg) = match line.find(':') {
+                        None => continue,
+                        Some(idx) => (&line[..idx], line[idx + 1..].trim()),
+                    };
+                    let dest = dest
+                        .split(',')
+                        .map(|name| name.trim().to_string())
+                        .collect::<Vec<_>>();
+                    let msg = msg.to_string();
 
-                broker
-                    .send(Event::Message {
-                        from: name.clone(),
-                        to: dest,
-                        msg,
-                    })
-                    .unwrap();
+                    broker
+                        .send(Event::Message {
+                            from: name.clone(),
+                            to: dest,
+                            msg,
+                        })
+                        .unwrap();
+                },
+                Ok(None) => {
+                    break;
+                },
+                Err(e) => {
+                    println!("Error: {:?}", e );
+                    break
+                }
             },
             _ = shutdown.notified() => break
         }
