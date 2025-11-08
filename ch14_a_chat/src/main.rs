@@ -1,9 +1,12 @@
-use std::collections::hash_map::{Entry, HashMap};
+use std::{
+    collections::hash_map::{Entry, HashMap},
+    sync::Arc,
+};
 
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream, ToSocketAddrs, tcp::OwnedWriteHalf},
-    sync::mpsc,
+    sync::{Notify, mpsc},
     task,
 };
 
@@ -20,17 +23,32 @@ async fn accept_loop(addr: impl ToSocketAddrs) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
 
     let (broker_sender, broker_receiver) = mpsc::unbounded_channel();
-    let _broker = task::spawn(broker_loop(broker_receiver));
+    let broker = task::spawn(broker_loop(broker_receiver));
+    let shutdown_notification = Arc::new(Notify::new());
 
-    while let Ok((stream, _socket_addr)) = listener.accept().await {
-        println!("accepting from: {}", stream.peer_addr()?);
-        spawn_and_log_error(connection_loop(broker_sender.clone(), stream));
+    loop {
+        tokio::select! {
+            Ok((stream, _socket_addr)) = listener.accept() => {
+                println!("accepting from: {}", stream.peer_addr()?);
+                spawn_and_log_error(connection_loop(broker_sender.clone(), stream, shutdown_notification.clone()));
+            },
+            _ = tokio::signal::ctrl_c() => break
+        }
     }
+
+    println!("shutting down server...");
+    shutdown_notification.notify_waiters();
+    drop(broker_sender);
+    broker.await?;
 
     Ok(())
 }
 
-async fn connection_loop(broker: Sender<Event>, stream: TcpStream) -> Result<()> {
+async fn connection_loop(
+    broker: Sender<Event>,
+    stream: TcpStream,
+    shutdown: Arc<Notify>,
+) -> Result<()> {
     let (reader, writer) = stream.into_split();
     let reader = BufReader::new(reader);
     let mut lines = reader.lines();
@@ -51,7 +69,8 @@ async fn connection_loop(broker: Sender<Event>, stream: TcpStream) -> Result<()>
         .unwrap();
 
     loop {
-        if let Some(line) = lines.next_line().await? {
+        tokio::select! {
+        Ok(Some(line)) = lines.next_line()=> {
             let (dest, msg) = match line.find(':') {
                 None => continue,
                 Some(idx) => (&line[..idx], line[idx + 1..].trim()),
@@ -69,8 +88,8 @@ async fn connection_loop(broker: Sender<Event>, stream: TcpStream) -> Result<()>
                     msg,
                 })
                 .unwrap();
-        } else {
-            break;
+        },
+        _ = shutdown.notified() => break
         }
     }
 
@@ -134,6 +153,8 @@ async fn broker_loop(mut events: Receiver<Event>) {
             },
         }
     }
+
+    drop(peers)
 }
 
 fn spawn_and_log_error<F: Future<Output = Result<()>> + Send + 'static>(
