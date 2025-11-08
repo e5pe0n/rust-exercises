@@ -6,7 +6,7 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream, ToSocketAddrs, tcp::OwnedWriteHalf},
-    sync::{Notify, mpsc},
+    sync::{Notify, mpsc, oneshot},
     task,
 };
 
@@ -61,37 +61,43 @@ async fn connection_loop(
 
     println!("user {} connected", name);
 
+    let (shutdown_sender, shutdown_receiver) = oneshot::channel::<()>();
+
     broker
         .send(Event::NewPeer {
             name: name.clone(),
             stream: writer,
+            shutdown: shutdown_receiver,
         })
         .unwrap();
 
     loop {
         tokio::select! {
-        Ok(Some(line)) = lines.next_line()=> {
-            let (dest, msg) = match line.find(':') {
-                None => continue,
-                Some(idx) => (&line[..idx], line[idx + 1..].trim()),
-            };
-            let dest = dest
-                .split(',')
-                .map(|name| name.trim().to_string())
-                .collect::<Vec<_>>();
-            let msg = msg.to_string();
+            Ok(Some(line)) = lines.next_line() => {
+                let (dest, msg) = match line.find(':') {
+                    None => continue,
+                    Some(idx) => (&line[..idx], line[idx + 1..].trim()),
+                };
+                let dest = dest
+                    .split(',')
+                    .map(|name| name.trim().to_string())
+                    .collect::<Vec<_>>();
+                let msg = msg.to_string();
 
-            broker
-                .send(Event::Message {
-                    from: name.clone(),
-                    to: dest,
-                    msg,
-                })
-                .unwrap();
-        },
-        _ = shutdown.notified() => break
+                broker
+                    .send(Event::Message {
+                        from: name.clone(),
+                        to: dest,
+                        msg,
+                    })
+                    .unwrap();
+            },
+            _ = shutdown.notified() => break
         }
     }
+
+    println!("closing connection loop...");
+    drop(shutdown_sender);
 
     Ok(())
 }
@@ -99,14 +105,20 @@ async fn connection_loop(
 async fn connection_write_loop(
     messages: &mut Receiver<String>,
     stream: &mut OwnedWriteHalf,
+    mut shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
     loop {
-        let msg = messages.recv().await;
-        match msg {
-            Some(msg) => stream.write_all(msg.as_bytes()).await?,
-            None => break,
+        tokio::select! {
+            msg = messages.recv() => match msg {
+                Some(msg) => stream.write_all(msg.as_bytes()).await?,
+                None => break,
+            },
+            _ = &mut shutdown => break
         }
     }
+
+    println!("closing connection_write_loop...");
+
     Ok(())
 }
 
@@ -115,6 +127,7 @@ enum Event {
     NewPeer {
         name: String,
         stream: OwnedWriteHalf,
+        shutdown: oneshot::Receiver<()>,
     },
     Message {
         from: String,
@@ -124,12 +137,22 @@ enum Event {
 }
 
 async fn broker_loop(mut events: Receiver<Event>) {
+    let (disconnect_sender, mut disconnect_receiver) =
+        mpsc::unbounded_channel::<(String, Receiver<String>)>();
     let mut peers: HashMap<String, Sender<String>> = HashMap::new();
 
     loop {
-        let event = match events.recv().await {
-            Some(event) => event,
-            None => break,
+        let event = tokio::select! {
+            event = events.recv() => match event {
+                Some(event) => event,
+                None => break,
+            },
+            disconnect = disconnect_receiver.recv() => {
+                let (name, _pending_messages) = disconnect.unwrap();
+                assert!(peers.remove(&name).is_some());
+                println!("user {} disconnected", name);
+                continue;
+            }
         };
 
         match event {
@@ -141,20 +164,32 @@ async fn broker_loop(mut events: Receiver<Event>) {
                     }
                 }
             }
-            Event::NewPeer { name, mut stream } => match peers.entry(name.clone()) {
+            Event::NewPeer {
+                name,
+                mut stream,
+                shutdown,
+            } => match peers.entry(name.clone()) {
                 Entry::Occupied(..) => (),
                 Entry::Vacant(entry) => {
                     let (client_sender, mut client_receiver) = mpsc::unbounded_channel();
                     entry.insert(client_sender);
+                    let disconnect_sender = disconnect_sender.clone();
                     spawn_and_log_error(async move {
-                        connection_write_loop(&mut client_receiver, &mut stream).await
+                        let res =
+                            connection_write_loop(&mut client_receiver, &mut stream, shutdown)
+                                .await;
+                        println!("user {} disconnected", name);
+                        disconnect_sender.send((name, client_receiver)).unwrap();
+                        res
                     });
                 }
             },
         }
     }
 
-    drop(peers)
+    drop(peers);
+    drop(disconnect_sender);
+    while let Some((_name, _pending_messages)) = disconnect_receiver.recv().await {}
 }
 
 fn spawn_and_log_error<F: Future<Output = Result<()>> + Send + 'static>(
